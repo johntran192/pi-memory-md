@@ -6,7 +6,14 @@ import matter from "gray-matter";
 import { DEFAULT_HOOKS, normalizeHooks } from "./hooks.js";
 import { normalizeTapeKeywords } from "./tape/tape-gate.js";
 import type { MemoryFile, MemoryFrontmatter, MemoryMdSettings, MemoryMeta, ParsedFrontmatter } from "./types.js";
-import { DEFAULT_LOCAL_PATH, DEFAULT_TAPE_EXCLUDE_DIRS, escapeXml, expandHomePath, getProjectMeta } from "./utils.js";
+import {
+  DEFAULT_LOCAL_PATH,
+  DEFAULT_TAPE_EXCLUDE_DIRS,
+  escapeXml,
+  expandHomePath,
+  getCurrentDate,
+  getProjectMeta,
+} from "./utils.js";
 
 export * from "./types.js";
 export { DEFAULT_LOCAL_PATH, getCurrentDate } from "./utils.js";
@@ -400,6 +407,65 @@ export async function listMemoryFilesAsync(memoryDir: string): Promise<string[]>
 export function writeMemoryFile(filePath: string, content: string, frontmatter: MemoryFrontmatter): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, matter.stringify(content, frontmatter));
+}
+
+/** Overwritten in place — state is a snapshot, not a log, so history here misleads. */
+export const SESSION_STATE_FILENAME = "state.md";
+
+export type SessionStateInput = {
+  cwd: string;
+  filesTouched: string[];
+  lastPrompt: string;
+  compactionCount: number;
+  now?: Date;
+};
+
+function readFrontmatterValue(filePath: string, key: "created"): string | undefined {
+  try {
+    const parsed = matter(fs.readFileSync(filePath, "utf-8"));
+    const value = parsed.data?.[key];
+    return typeof value === "string" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function renderSessionState(input: SessionStateInput): string {
+  const iso = (input.now ?? new Date()).toISOString();
+  const lines = [
+    "# Session state (auto-captured)",
+    "",
+    "Snapshot taken right before a compaction summarized this session. It is current",
+    "state, not a durable rule: overwrite or delete it once the work is finished.",
+    "",
+    `- captured: ${iso}`,
+    `- cwd: ${input.cwd}`,
+    `- compactions so far: ${input.compactionCount}`,
+  ];
+
+  if (input.filesTouched.length > 0) {
+    lines.push("", "## Files edited this session", "");
+    for (const filePath of input.filesTouched) lines.push(`- ${filePath}`);
+  }
+
+  if (input.lastPrompt.trim()) {
+    lines.push("", "## Last user request", "", input.lastPrompt.trim());
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+/** Writes `<memoryDir>/core/state.md`, preserving the original `created` date. */
+export function writeSessionStateFile(memoryDir: string, input: SessionStateInput): string {
+  const filePath = path.join(getMemoryCoreDir(memoryDir), SESSION_STATE_FILENAME);
+  const today = getCurrentDate();
+  writeMemoryFile(filePath, renderSessionState(input), {
+    description: "Session state auto-captured before compaction: edited files and last request",
+    tags: ["state", "session"],
+    created: readFrontmatterValue(filePath, "created") ?? today,
+    updated: today,
+  });
+  return filePath;
 }
 
 // Deprecated after migrating initialization to memory-init skill.

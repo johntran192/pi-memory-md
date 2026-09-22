@@ -18,10 +18,11 @@ import {
   // initializeMemoryDirectory, // unused after memory-init moved to SKILL
   loadSettings,
   renderMemoryTree,
+  writeSessionStateFile,
 } from "./memory-core.js";
 
 import { gitExec, pushRepository, syncRepository } from "./memory-git.js";
-import { MemoryFileSelector } from "./tape/tape-context.js";
+import { extractMessageContent, MemoryFileSelector } from "./tape/tape-context.js";
 import {
   detectKeywordHandoff,
   type KeywordHandoffInstruction,
@@ -337,6 +338,52 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const STATE_CAPTURE_TOOL_NAMES = new Set(["edit", "write"]);
+const STATE_CAPTURE_PROMPT_MAX_CHARS = 600;
+
+/**
+ * Deterministic snapshot of what this session changed: no model call, so enabling
+ * it cannot slow a compaction down or spend tokens.
+ */
+function collectSessionState(ctx: ExtensionContext): {
+  filesTouched: string[];
+  lastPrompt: string;
+  compactionCount: number;
+} {
+  const entries = (ctx.sessionManager.getEntries?.() ?? []) as Array<{
+    type?: string;
+    message?: { role?: string; content?: unknown };
+  }>;
+  const filesTouched = new Set<string>();
+  let lastPrompt = "";
+  let compactionCount = 0;
+
+  for (const entry of entries) {
+    if (entry.type === "compaction") compactionCount += 1;
+
+    const content = entry.message?.content;
+    if (!content) continue;
+
+    if (entry.message?.role === "user") {
+      const text = extractMessageContent(content).trim();
+      if (text) lastPrompt = text.slice(0, STATE_CAPTURE_PROMPT_MAX_CHARS);
+      continue;
+    }
+
+    if (!Array.isArray(content)) continue;
+
+    for (const part of content) {
+      const toolCall = part as { type?: string; name?: string; arguments?: Record<string, unknown> };
+      if (toolCall.type !== "toolCall" || !toolCall.name || !STATE_CAPTURE_TOOL_NAMES.has(toolCall.name)) continue;
+      const args = toolCall.arguments ?? {};
+      const filePath = args.path ?? args.file_path ?? args.filePath;
+      if (typeof filePath === "string" && filePath.trim()) filesTouched.add(filePath.trim());
+    }
+  }
+
+  return { filesTouched: [...filesTouched].sort(), lastPrompt, compactionCount };
+}
+
 /**
  * `ctx.ui` belongs to the session that created it: a session replacement leaves a
  * stale context whose notify throws. Only that case is swallowed.
@@ -514,6 +561,24 @@ function registerLifecycleHandlers(pi: ExtensionAPI, settings: MemoryMdSettings,
       queueSessionBridgeMessage(pi, sessionBridgeContext);
     }
     return deliverStartupContext(settings, state, ctx, event, tapeState, sessionBridgeContext);
+  });
+
+  // Compaction is the last moment before the transcript is summarized, so it is the
+  // last moment a deterministic snapshot of the session can be persisted. Opt-in:
+  // it writes a file on the user's behalf.
+  pi.on("session_before_compact", async (_event, ctx) => {
+    if (!settings.enabled || settings.stateCapture !== true) return;
+
+    const memoryDir = getMemoryDir(settings, ctx.cwd);
+    if (!fs.existsSync(getMemoryCoreDir(memoryDir))) return;
+
+    try {
+      const state = collectSessionState(ctx);
+      writeSessionStateFile(memoryDir, { ...state, cwd: ctx.cwd });
+      safeNotify(ctx, "Session state captured to core/state.md before compaction", "info");
+    } catch (error) {
+      safeNotify(ctx, `Session state capture failed: ${describeError(error)}`, "warning");
+    }
   });
 
   // Compaction summarizes the transcript, and the index sits at the front of it as a

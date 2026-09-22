@@ -561,3 +561,85 @@ test("memory-refresh delivers the index once and does not queue a second copy", 
   assert.equal(nextTurn, undefined, "refresh must not make the next prompt inject a duplicate");
   assert.equal(extension.sentMessages.length, 1);
 });
+
+function messageEntry(role: "user" | "assistant", content: unknown, id: string): SessionEntry {
+  return {
+    type: "message",
+    timestamp: "2026-09-22T00:00:00.000Z",
+    id,
+    parentId: null,
+    message: { role, content },
+  } as unknown as SessionEntry;
+}
+
+test("session_before_compact captures files and the last request when stateCapture is on", async () => {
+  const homeDir = createTempDir("pi-memory-md-state-home");
+  const projectDir = createTempDir("pi-memory-md-state-project");
+  const localPath = path.join(homeDir, "memory-root");
+  const memoryDir = createProjectMemory(projectDir, localPath);
+
+  writeJson(path.join(homeDir, ".pi", "agent", "settings.json"), {
+    "pi-memory-md": { localPath, tape: { enabled: false }, stateCapture: true },
+  });
+
+  const extension = bootExtension(homeDir, projectDir);
+  const beforeCompact = extension.handlers.get("session_before_compact");
+  assert.ok(beforeCompact);
+
+  const entries = [
+    messageEntry("user", "đổi tên file cho đúng quy ước", "m1"),
+    messageEntry(
+      "assistant",
+      [
+        { type: "text", text: "ok" },
+        { type: "toolCall", id: "t1", name: "edit", arguments: { path: "apps/web/src/a.tsx" } },
+        { type: "toolCall", id: "t2", name: "write", arguments: { file_path: "apps/web/src/b.ts" } },
+        { type: "toolCall", id: "t3", name: "read", arguments: { path: "apps/web/src/c.ts" } },
+      ],
+      "m2",
+    ),
+    { type: "compaction", timestamp: "2026-09-22T00:00:01.000Z", id: "c1", parentId: null } as unknown as SessionEntry,
+  ];
+
+  const ui = createUi();
+  await beforeCompact?.({ preparation: {} }, { cwd: projectDir, ui, sessionManager: createSessionManager(entries) });
+
+  const statePath = path.join(memoryDir, "core", "state.md");
+  assert.ok(fs.existsSync(statePath), "state.md should exist");
+  const written = fs.readFileSync(statePath, "utf-8");
+
+  assert.match(written, /Files edited this session/);
+  assert.match(written, /apps\/web\/src\/a\.tsx/);
+  assert.match(written, /apps\/web\/src\/b\.ts/);
+  assert.doesNotMatch(written, /apps\/web\/src\/c\.ts/, "read-only access is not an edit");
+  assert.match(written, /đổi tên file cho đúng quy ước/);
+  assert.match(written, /compactions so far: 1/);
+  assert.match(written, /Session state auto-captured before compaction: edited files/);
+  assert.equal(ui.notifications.filter((item) => /Session state captured/.test(item.message)).length, 1);
+});
+
+test("session_before_compact writes nothing when stateCapture is off", async () => {
+  const homeDir = createTempDir("pi-memory-md-state-home-off");
+  const projectDir = createTempDir("pi-memory-md-state-project-off");
+  const localPath = path.join(homeDir, "memory-root");
+  const memoryDir = createProjectMemory(projectDir, localPath);
+
+  writeJson(path.join(homeDir, ".pi", "agent", "settings.json"), {
+    "pi-memory-md": { localPath, tape: { enabled: false } },
+  });
+
+  const extension = bootExtension(homeDir, projectDir);
+  const beforeCompact = extension.handlers.get("session_before_compact");
+  assert.ok(beforeCompact);
+
+  await beforeCompact?.(
+    { preparation: {} },
+    {
+      cwd: projectDir,
+      ui: createUi(),
+      sessionManager: createSessionManager([messageEntry("user", "hello", "m1")]),
+    },
+  );
+
+  assert.equal(fs.existsSync(path.join(memoryDir, "core", "state.md")), false);
+});

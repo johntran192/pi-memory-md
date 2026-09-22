@@ -66,6 +66,12 @@ export interface MemoryMdSettings {
    * so the model knows the index is incomplete. 0 disables the cap.
    */
   maxContextChars?: number;
+  /**
+   * When true, write `<memoryDir>/core/state.md` just before a compaction: files
+   * edited this session plus the last request. Deterministic on purpose — no model
+   * call, no extra latency. Off by default because it writes a file for you.
+   */
+  stateCapture?: boolean;
   memoryDir?: {
     repoUrl?: string;
     localPath?: string;
