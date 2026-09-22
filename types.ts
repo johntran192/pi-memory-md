@@ -60,6 +60,12 @@ export interface MemoryMdSettings {
   /** @deprecated Use `delivery` instead. */
   injection?: MemoryDeliveryMode;
   tape?: TapeConfig;
+  /**
+   * Character budget for the injected memory index. Entries past the budget are
+   * dropped (global memory first, project entries last) and a notice is injected
+   * so the model knows the index is incomplete. 0 disables the cap.
+   */
+  maxContextChars?: number;
   memoryDir?: {
     repoUrl?: string;
     localPath?: string;

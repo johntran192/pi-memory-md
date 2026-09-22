@@ -15,12 +15,14 @@ type ExtensionHarness = {
   handlers: HandlerMap;
   sentMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }>;
   registeredCommands: string[];
+  commandHandlers: Map<string, (args: string, ctx: any) => Promise<unknown> | unknown>;
 };
 
 function bootExtension(homeDir: string, projectDir: string): ExtensionHarness {
   const handlers: HandlerMap = new Map();
   const sentMessages: Array<{ message: Record<string, unknown>; options?: Record<string, unknown> }> = [];
   const registeredCommands: string[] = [];
+  const commandHandlers = new Map<string, (args: string, ctx: any) => Promise<unknown> | unknown>();
   const homedirMock = mock.method(os, "homedir", () => homeDir);
   const previousCwd = process.cwd();
 
@@ -31,8 +33,9 @@ function bootExtension(homeDir: string, projectDir: string): ExtensionHarness {
         handlers.set(name, handler);
       },
       registerTool() {},
-      registerCommand(name: string) {
+      registerCommand(name: string, options?: { handler?: (args: string, ctx: any) => Promise<unknown> | unknown }) {
         registeredCommands.push(name);
+        if (options?.handler) commandHandlers.set(name, options.handler);
       },
       sendMessage(message: Record<string, unknown>, options?: Record<string, unknown>) {
         sentMessages.push({ message, options });
@@ -43,7 +46,7 @@ function bootExtension(homeDir: string, projectDir: string): ExtensionHarness {
     homedirMock.mock.restore();
   }
 
-  return { handlers, sentMessages, registeredCommands };
+  return { handlers, sentMessages, registeredCommands, commandHandlers };
 }
 
 function createProjectMemory(projectDir: string, localPath: string): string {
@@ -467,4 +470,94 @@ test("reloading extension picks up updated settings and switches behavior", asyn
   assert.equal((firstResult as any).message.customType, "pi-memory-md");
   assert.match((secondResult as any).systemPrompt, /Tape is enabled/);
   assert.equal(reloadedExtension.registeredCommands.includes("memory-anchor"), true);
+});
+
+test("session_compact re-injects the index in message-append mode without duplicating it", async () => {
+  const homeDir = createTempDir("pi-memory-md-compact-home");
+  const projectDir = createTempDir("pi-memory-md-compact-project");
+  const localPath = path.join(homeDir, "memory-root");
+  createProjectMemory(projectDir, localPath);
+
+  writeJson(path.join(homeDir, ".pi", "agent", "settings.json"), {
+    "pi-memory-md": { localPath, tape: { enabled: false }, delivery: "message-append" },
+  });
+
+  const extension = bootExtension(homeDir, projectDir);
+  const beforeAgentStart = extension.handlers.get("before_agent_start");
+  const sessionCompact = extension.handlers.get("session_compact");
+  assert.ok(beforeAgentStart);
+  assert.ok(sessionCompact);
+
+  const ui = createUi();
+  const ctx = { cwd: projectDir, ui, sessionManager: createSessionManager() };
+
+  const first = await beforeAgentStart?.({ prompt: "hello", systemPrompt: "SYSTEM" }, ctx);
+  assert.equal((first as any).message.customType, "pi-memory-md");
+
+  await sessionCompact?.({ compactionEntry: { id: "compaction-1" } }, ctx);
+
+  assert.equal(extension.sentMessages.length, 1);
+  assert.equal(extension.sentMessages[0].message.customType, "pi-memory-md-compact-refresh");
+  assert.match(String(extension.sentMessages[0].message.content), /<memory_context mode="normal">/);
+  assert.equal(extension.sentMessages[0].message.display, false);
+
+  const afterCompaction = await beforeAgentStart?.({ prompt: "continue", systemPrompt: "SYSTEM" }, ctx);
+  assert.equal(afterCompaction, undefined, "index must not be delivered twice after compaction");
+  assert.equal(extension.sentMessages.length, 1);
+});
+
+test("session_compact leaves system-prompt delivery alone", async () => {
+  const homeDir = createTempDir("pi-memory-md-compact-home-system");
+  const projectDir = createTempDir("pi-memory-md-compact-project-system");
+  const localPath = path.join(homeDir, "memory-root");
+  createProjectMemory(projectDir, localPath);
+
+  writeJson(path.join(homeDir, ".pi", "agent", "settings.json"), {
+    "pi-memory-md": { localPath, tape: { enabled: false }, delivery: "system-prompt" },
+  });
+
+  const extension = bootExtension(homeDir, projectDir);
+  const sessionCompact = extension.handlers.get("session_compact");
+  assert.ok(sessionCompact);
+
+  await sessionCompact?.(
+    { compactionEntry: { id: "compaction-1" } },
+    {
+      cwd: projectDir,
+      ui: createUi(),
+      sessionManager: createSessionManager(),
+    },
+  );
+
+  assert.equal(extension.sentMessages.length, 0);
+});
+
+test("memory-refresh delivers the index once and does not queue a second copy", async () => {
+  const homeDir = createTempDir("pi-memory-md-refresh-home");
+  const projectDir = createTempDir("pi-memory-md-refresh-project");
+  const localPath = path.join(homeDir, "memory-root");
+  createProjectMemory(projectDir, localPath);
+
+  writeJson(path.join(homeDir, ".pi", "agent", "settings.json"), {
+    "pi-memory-md": { localPath, tape: { enabled: false }, delivery: "message-append" },
+  });
+
+  const extension = bootExtension(homeDir, projectDir);
+  const beforeAgentStart = extension.handlers.get("before_agent_start");
+  const refresh = extension.commandHandlers.get("memory-refresh");
+  assert.ok(beforeAgentStart);
+  assert.ok(refresh);
+
+  const ui = createUi();
+  const ctx = { cwd: projectDir, ui, sessionManager: createSessionManager() };
+
+  await beforeAgentStart?.({ prompt: "hello", systemPrompt: "SYSTEM" }, ctx);
+  await refresh?.("", ctx);
+
+  assert.equal(extension.sentMessages.length, 1);
+  assert.equal(extension.sentMessages[0].message.customType, "pi-memory-md-refresh");
+
+  const nextTurn = await beforeAgentStart?.({ prompt: "next", systemPrompt: "SYSTEM" }, ctx);
+  assert.equal(nextTurn, undefined, "refresh must not make the next prompt inject a duplicate");
+  assert.equal(extension.sentMessages.length, 1);
 });

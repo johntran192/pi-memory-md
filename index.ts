@@ -333,6 +333,22 @@ async function maybeBuildSessionBridgeContext(
   });
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * `ctx.ui` belongs to the session that created it: a session replacement leaves a
+ * stale context whose notify throws. Only that case is swallowed.
+ */
+function safeNotify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
+  try {
+    ctx.ui.notify(message, level);
+  } catch (error) {
+    if (!describeError(error).includes("extension ctx is stale")) throw error;
+  }
+}
+
 function deliverStartupContext(
   settings: MemoryMdSettings,
   state: ExtensionState,
@@ -500,6 +516,36 @@ function registerLifecycleHandlers(pi: ExtensionAPI, settings: MemoryMdSettings,
     return deliverStartupContext(settings, state, ctx, event, tapeState, sessionBridgeContext);
   });
 
+  // Compaction summarizes the transcript, and the index sits at the front of it as a
+  // custom message, so a long session can lose the whole memory index mid-flight
+  // (pi chooses custom messages as a cut point). Re-inject it after every successful
+  // compaction. system-prompt delivery already re-appends it on each agent start.
+  pi.on("session_compact", async (_event, ctx) => {
+    if (!settings.enabled) return;
+    if ((settings.delivery ?? settings.injection ?? "message-append") !== "message-append") return;
+
+    try {
+      await cacheInitialContext(settings, state, ctx);
+    } catch (error) {
+      safeNotify(ctx, `Memory index refresh failed after compaction: ${describeError(error)}`, "warning");
+      return;
+    }
+
+    const memoryContext = getReadyContext(state.initialMemoryContext);
+    if (!memoryContext) return;
+
+    state.hasDeliveredInitialContext = true;
+    pi.sendMessage(
+      {
+        customType: "pi-memory-md-compact-refresh",
+        content: memoryContext.content,
+        display: false,
+      },
+      { triggerTurn: false },
+    );
+    safeNotify(ctx, `Memory index re-injected after compaction (${memoryContext.fileCount} files)`, "info");
+  });
+
   pi.on("session_shutdown", async (_event, ctx) => {
     const activeTapeRuntime = state.activeTapeRuntime;
     state.activeTapeRuntime = null;
@@ -592,13 +638,15 @@ function registerMemoryCommands(pi: ExtensionAPI, settings: MemoryMdSettings, st
         return;
       }
 
-      state.hasDeliveredInitialContext = false;
-
       const mode = settings.delivery ?? settings.injection ?? "message-append";
 
       const { content, fileCount } = memoryContext;
 
       if (mode === "message-append") {
+        // The message is delivered right here, so the "already delivered" flag must
+        // stay true; leaving it false made the next before_agent_start inject a
+        // second copy of the index.
+        state.hasDeliveredInitialContext = true;
         pi.sendMessage({
           customType: "pi-memory-md-refresh",
           content,
